@@ -203,6 +203,12 @@ static bool ExecHashJoinNewBatch(HashJoinState *hjstate);
 static bool ExecParallelHashJoinNewBatch(HashJoinState *hjstate);
 static void ExecParallelHashJoinPartitionOuter(HashJoinState *hjstate);
 
+#ifdef __GNUC__
+static inline void prefetch_hash_bucket(HashJoinTable hashtable, int bucketno) {
+    if (bucketno >= 0 && bucketno < hashtable->nbuckets)
+        __builtin_prefetch(&hashtable->buckets.unshared[bucketno], 0);
+}
+#endif
 
 /* ----------------------------------------------------------------
  *		ExecHashJoinImpl
@@ -231,6 +237,11 @@ ExecHashJoinImpl(PlanState *pstate, bool parallel)
 	uint32		hashvalue;
 	int			batchno;
 	ParallelHashJoinState *parallel_state;
+
+	/* Lookahead buffer for prefetching */
+	TupleTableSlot *lookaheadSlot = NULL;
+	uint32 lookaheadHash = 0;
+	bool lookaheadValid = false;
 
 	/*
 	 * get information from HashJoin node
@@ -427,9 +438,37 @@ ExecHashJoinImpl(PlanState *pstate, bool parallel)
 					outerTupleSlot =
 						ExecParallelHashJoinOuterGetTuple(outerNode, node,
 														  &hashvalue);
+				else if (lookaheadValid)
+				{
+					/* Use lookahead buffer if available */
+					outerTupleSlot = lookaheadSlot;
+					hashvalue = lookaheadHash;
+					lookaheadSlot = NULL;
+					lookaheadValid = false;
+				}
 				else
 					outerTupleSlot =
 						ExecHashJoinOuterGetTuple(outerNode, node, &hashvalue);
+
+				/* Prefetch the next bucket if possible (non-parallel only) */
+#ifndef __GNUC__
+				/* nothing */
+#else
+				if (!parallel && !TupIsNull(outerTupleSlot))
+				{
+					/* Try to fetch and buffer the next tuple */
+					TupleTableSlot *nextSlot = ExecHashJoinOuterGetTuple(outerNode, node, &lookaheadHash);
+					if (!TupIsNull(nextSlot))
+					{
+						lookaheadSlot = nextSlot;
+						lookaheadValid = true;
+						/* Compute bucket for lookahead and prefetch */
+						int next_bucketno, next_batchno;
+						ExecHashGetBucketAndBatch(node->hj_HashTable, lookaheadHash, &next_bucketno, &next_batchno);
+						prefetch_hash_bucket(node->hj_HashTable, next_bucketno);
+					}
+				}
+#endif
 
 				if (TupIsNull(outerTupleSlot))
 				{
