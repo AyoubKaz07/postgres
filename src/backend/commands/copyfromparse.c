@@ -71,7 +71,9 @@
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "port/pg_bitutils.h"
 #include "port/pg_bswap.h"
+#include "port/simd.h"
 #include "utils/builtins.h"
 #include "utils/rel.h"
 
@@ -1255,6 +1257,17 @@ CopyReadLineText(CopyFromState cstate, bool is_csv)
 	char		quotec = '\0';
 	char		escapec = '\0';
 
+#ifndef USE_NO_SIMD
+	Vector8		nl = vector8_broadcast('\n');
+	Vector8		cr = vector8_broadcast('\r');
+	Vector8		bs = vector8_broadcast('\\');
+	Vector8		quote;
+	Vector8		escape;
+
+	int			sleep_cyle = 0;
+	int			last_sleep_cyle = 1;
+#endif
+
 	if (is_csv)
 	{
 		quotec = cstate->opts.quote[0];
@@ -1262,6 +1275,12 @@ CopyReadLineText(CopyFromState cstate, bool is_csv)
 		/* ignore special escape processing if it's the same as quotec */
 		if (quotec == escapec)
 			escapec = '\0';
+
+#ifndef USE_NO_SIMD
+		quote = vector8_broadcast(quotec);
+		if (quotec != escapec)
+			escape = vector8_broadcast(escapec);
+#endif
 	}
 
 	/*
@@ -1327,6 +1346,97 @@ CopyReadLineText(CopyFromState cstate, bool is_csv)
 			}
 			need_data = false;
 		}
+
+#ifndef USE_NO_SIMD
+		/*
+		 * SIMD instructions are used here to efficiently scan the input buffer
+		 * for special characters (e.g., newline, carriage return, quotes, or
+		 * escape characters). This approach significantly improves performance
+		 * compared to byte-by-byte iteration, especially for large input
+		 * buffers.
+		 *
+		 * However, SIMD optimization cannot be applied in the following cases:
+		 * - Inside quoted fields, where escape sequences and closing quotes
+		 *   require sequential processing to handle correctly.
+		 * - When the remaining buffer size is smaller than the size of a SIMD
+		 *   vector register, as SIMD operations require processing data in
+		 *   fixed-size chunks.
+		 */
+		if (sleep_cyle <= 0 && !in_quote && copy_buf_len - input_buf_ptr >= sizeof(Vector8))
+		{
+			Vector8		chunk;
+			Vector8		match;
+			uint32		mask;
+
+			/* Load a chunk of data into a vector register */
+			vector8_load(&chunk, (const uint8 *) &copy_input_buf[input_buf_ptr]);
+
+			/* Create a mask of all special characters we need to stop at */
+			match = vector8_or(vector8_eq(chunk, nl), vector8_eq(chunk, cr));
+
+			if (is_csv)
+			{
+				match = vector8_or(match, vector8_eq(chunk, quote));
+				if (escapec != '\0')
+					match = vector8_or(match, vector8_eq(chunk, escape));
+			}
+			else
+				match = vector8_or(match, vector8_eq(chunk, bs));
+
+			/* Check if we found any special characters */
+			mask = vector8_highbit_mask(match);
+			if (mask != 0)
+			{
+				/*
+				 * Found a special character. Advance up to that point and let
+				 * the scalar code handle it.
+				 */
+				int advance = pg_rightmost_one_pos32(mask);
+				input_buf_ptr += advance;
+
+				/*
+				 * If we advance less than 5 characters we cause regression.
+				 * Sleep a bit then try again. Sleep time increases
+				 * exponentially.
+				 */
+				if (advance < 5)
+				{
+					if (last_sleep_cyle >= PG_INT16_MAX / 2)
+						last_sleep_cyle = PG_INT16_MAX;
+					else
+						last_sleep_cyle = last_sleep_cyle << 1;
+
+					sleep_cyle = last_sleep_cyle;
+				}
+
+				/*
+				 * If we advance more than 4 charactes this means we have
+				 * performance improvement. Halve sleep time for next sleep.
+				 */
+				else
+				{
+					last_sleep_cyle = Max(last_sleep_cyle >> 1, 1);
+					sleep_cyle = 0;
+				}
+			}
+			else
+			{
+				/*
+				 * No special characters found, so skip the entire chunk and
+				 * halve sleep time for next sleep.
+				 */
+				input_buf_ptr += sizeof(Vector8);
+				last_sleep_cyle = Max(last_sleep_cyle >> 1, 1);
+				continue;
+			}
+		}
+
+		/*
+		 * Vulnerable to overflow if we are in quote for more than INT16_MAX
+		 * characters.
+		 */
+		sleep_cyle--;
+#endif
 
 		/* OK to fetch a character */
 		prev_raw_ptr = input_buf_ptr;
