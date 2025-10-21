@@ -84,6 +84,8 @@ static inline uint32 vector8_highbit_mask(const Vector8 v);
 
 /* arithmetic operations */
 static inline Vector8 vector8_or(const Vector8 v1, const Vector8 v2);
+static inline Vector8 vector8_and(const Vector8 v1, const Vector8 v2);
+static inline Vector8 vector8_not(const Vector8 v);
 #ifndef USE_NO_SIMD
 static inline Vector32 vector32_or(const Vector32 v1, const Vector32 v2);
 static inline Vector8 vector8_ssub(const Vector8 v1, const Vector8 v2);
@@ -354,6 +356,65 @@ vector32_or(const Vector32 v1, const Vector32 v2)
 	return _mm_or_si128(v1, v2);
 #elif defined(USE_NEON)
 	return vorrq_u32(v1, v2);
+#endif
+}
+#endif							/* ! USE_NO_SIMD */
+
+/*
+ * Return the bitwise AND of the inputs.
+ */
+#ifndef USE_NO_SIMD
+static inline Vector8
+vector8_and(const Vector8 v1, const Vector8 v2)
+{
+#ifdef USE_SSE2
+	return _mm_and_si128(v1, v2);
+#elif defined(USE_NEON)
+	return vandq_u8(v1, v2);
+#endif
+}
+#endif							/* ! USE_NO_SIMD */
+
+/*
+ * Return the bitwise NOT of the input.
+ */
+static inline Vector8
+vector8_not(const Vector8 v)
+{
+#ifdef USE_SSE2
+	return _mm_xor_si128(v, _mm_set1_epi8(0xFF));
+#elif defined(USE_NEON)
+	return vmvnq_u8(v);
+#else
+	return ~v;
+#endif
+}
+
+static inline Vector8 vector8_from_bitmask(uint16_t mask)
+{
+    Vector8 result;
+    uint8_t bytes[16];
+    
+    for (int i = 0; i < 16; i++)
+    {
+        bytes[i] = (mask & (1 << i)) ? 0xFF : 0x00;
+    }
+    
+    vector8_load(&result, bytes);
+    return result;
+}
+
+/*
+ * Return the result of adding the respective elements of the input vectors.
+ */
+#ifndef USE_NO_SIMD
+static inline Vector8
+vector8_add(const Vector8 v1, const Vector8 v2)
+{
+#ifdef USE_SSE2
+	return _mm_add_epi8(v1, v2);
+#elif defined(USE_NEON)
+	return vaddq_u8(v1, v2);
 #endif
 }
 #endif							/* ! USE_NO_SIMD */

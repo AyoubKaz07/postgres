@@ -89,6 +89,15 @@ typedef struct CopyFromStateData
 	const char *cur_attval;		/* current att value for error messages */
 	bool		relname_only;	/* don't output line number, att, etc. */
 
+	/* SIMD variables */
+	bool		simd_continue;
+	bool		simd_initialized;
+	uint16		simd_last_sleep_cycle;
+	uint16		simd_current_sleep_cycle;
+	uint64_t prev_inside_quote;
+	uint64_t prev_odd_backslash;
+
+
 	/*
 	 * Working state
 	 */

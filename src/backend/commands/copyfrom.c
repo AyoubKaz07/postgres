@@ -1721,6 +1721,12 @@ BeginCopyFrom(ParseState *pstate,
 	cstate->cur_attval = NULL;
 	cstate->relname_only = false;
 
+	/* Initialize SIMD variables */
+	cstate->simd_continue = false;
+	cstate->simd_initialized = false;
+	cstate->simd_current_sleep_cycle = 0;
+	cstate->simd_last_sleep_cycle = 0;
+
 	/*
 	 * Allocate buffers for the input pipeline.
 	 *

@@ -143,12 +143,14 @@ static const char BinarySignature[11] = "PGCOPY\n\377\r\n\0";
 
 /* non-export function prototypes */
 static bool CopyReadLine(CopyFromState cstate, bool is_csv);
-static bool CopyReadLineText(CopyFromState cstate, bool is_csv);
 static int	CopyReadAttributesText(CopyFromState cstate);
 static int	CopyReadAttributesCSV(CopyFromState cstate);
 static Datum CopyReadBinaryAttribute(CopyFromState cstate, FmgrInfo *flinfo,
 									 Oid typioparam, int32 typmod,
 									 bool *isnull);
+static pg_attribute_always_inline bool CopyReadLineText(CopyFromState cstate,
+														bool is_csv,
+														bool simd_continue);
 static pg_attribute_always_inline bool CopyFromTextLikeOneRow(CopyFromState cstate,
 															  ExprContext *econtext,
 															  Datum *values,
@@ -1173,8 +1175,22 @@ CopyReadLine(CopyFromState cstate, bool is_csv)
 	resetStringInfo(&cstate->line_buf);
 	cstate->line_buf_valid = false;
 
-	/* Parse data and transfer into line_buf */
-	result = CopyReadLineText(cstate, is_csv);
+	/* If that is the first time we do read, initalize the SIMD */
+	if (unlikely(!cstate->simd_initialized))
+	{
+		cstate->simd_initialized = true;
+		cstate->simd_continue = true;
+		cstate->simd_current_sleep_cycle = 0;
+		cstate->simd_last_sleep_cycle = 0;
+		cstate->prev_inside_quote = 0;
+		cstate->prev_odd_backslash = 0;
+	}
+
+	/*
+	 * Parse data and transfer into line_buf. Use continuous SIMD processing
+	 * that always runs SIMD when possible, removing the legacy heuristics.
+	 */
+	result = CopyReadLineText(cstate, is_csv, true);
 
 	if (result)
 	{
@@ -1241,8 +1257,8 @@ CopyReadLine(CopyFromState cstate, bool is_csv)
 /*
  * CopyReadLineText - inner loop of CopyReadLine for text mode
  */
-static bool
-CopyReadLineText(CopyFromState cstate, bool is_csv)
+static pg_attribute_always_inline bool
+CopyReadLineText(CopyFromState cstate, bool is_csv, bool simd_continue)
 {
 	char	   *copy_input_buf;
 	int			input_buf_ptr;
@@ -1258,14 +1274,16 @@ CopyReadLineText(CopyFromState cstate, bool is_csv)
 	char		escapec = '\0';
 
 #ifndef USE_NO_SIMD
+#define SIMD_SLEEP_MAX 1024
+#define SIMD_ADVANCE_AT_LEAST 5
 	Vector8		nl = vector8_broadcast('\n');
 	Vector8		cr = vector8_broadcast('\r');
 	Vector8		bs = vector8_broadcast('\\');
-	Vector8		quote;
-	Vector8		escape;
+	Vector8		quote = vector8_broadcast(0);
+	Vector8		escape = vector8_broadcast(0);
 
-	int			sleep_cyle = 0;
-	int			last_sleep_cyle = 1;
+	uint64_t prev_odd_backslash = cstate->prev_odd_backslash;	/* New: carry for odd backslash */
+	uint64_t prev_inside_quote = cstate->prev_inside_quote;  /* New: carry for quote parity */
 #endif
 
 	if (is_csv)
@@ -1348,94 +1366,93 @@ CopyReadLineText(CopyFromState cstate, bool is_csv)
 		}
 
 #ifndef USE_NO_SIMD
+
 		/*
-		 * SIMD instructions are used here to efficiently scan the input buffer
-		 * for special characters (e.g., newline, carriage return, quotes, or
-		 * escape characters). This approach significantly improves performance
-		 * compared to byte-by-byte iteration, especially for large input
-		 * buffers.
+		 * Improved SIMD processing: Continuously process entire chunks
+		 * using vectorized operations to efficiently handle quoted regions
+		 * and escape sequences.
 		 *
-		 * However, SIMD optimization cannot be applied in the following cases:
-		 * - Inside quoted fields, where escape sequences and closing quotes
-		 *   require sequential processing to handle correctly.
-		 * - When the remaining buffer size is smaller than the size of a SIMD
-		 *   vector register, as SIMD operations require processing data in
-		 *   fixed-size chunks.
+		 * We only fall back to scalar processing for actual state changes
+		 * (unescaped quotes, line endings outside quotes).
 		 */
-		if (sleep_cyle <= 0 && !in_quote && copy_buf_len - input_buf_ptr >= sizeof(Vector8))
+		if (!last_was_esc && copy_buf_len - input_buf_ptr >= sizeof(Vector8))
 		{
 			Vector8		chunk;
-			Vector8		match;
-			uint32		mask;
+			uint32		real_special_mask;
 
 			/* Load a chunk of data into a vector register */
 			vector8_load(&chunk, (const uint8 *) &copy_input_buf[input_buf_ptr]);
 
-			/* Create a mask of all special characters we need to stop at */
-			match = vector8_or(vector8_eq(chunk, nl), vector8_eq(chunk, cr));
+		if (is_csv)
+		{
+			Vector8		quote_mask = vector8_eq(chunk, quote);
+			uint16_t	mask16 = vector8_highbit_mask(quote_mask);
+			Vector8		inside_quote_vec;
+			Vector8		nl_cr_mask;
+			Vector8		special_mask;
 
-			if (is_csv)
+			/* Handle escaped quotes */
+			if (escapec != '\0')
 			{
-				match = vector8_or(match, vector8_eq(chunk, quote));
-				if (escapec != '\0')
-					match = vector8_or(match, vector8_eq(chunk, escape));
+				Vector8 esc_mask = vector8_eq(chunk, escape);
+				uint16 esc_mask16 = vector8_highbit_mask(esc_mask);
+				uint16 odd_sequences = pg_find_odd_sequences16(esc_mask16, prev_odd_backslash);
+				cstate->prev_odd_backslash = (odd_sequences >> 15) & 1;
+        uint16_t escaped_quotes = (odd_sequences << 1) & mask16;
+				mask16 = mask16 & ~escaped_quotes;
 			}
-			else
-				match = vector8_or(match, vector8_eq(chunk, bs));
 
-			/* Check if we found any special characters */
-			mask = vector8_highbit_mask(match);
-			if (mask != 0)
+			/* Compute prefix XOR to get inside/outside state for each position */
+			uint16_t inside_prefix16 = pg_prefix_xor16_carry(mask16, prev_inside_quote & 1);
+			inside_prefix16 ^= mask16;
+
+			inside_quote_vec = vector8_from_bitmask(inside_prefix16);
+
+			nl_cr_mask = vector8_or(vector8_eq(chunk, nl), vector8_eq(chunk, cr));
+			nl_cr_mask = vector8_and(nl_cr_mask, vector8_not(inside_quote_vec));
+
+			/* Special characters: unescaped quotes or newlines outside quotes */
+			quote_mask = inside_quote_vec;
+			special_mask = vector8_or(quote_mask, nl_cr_mask);
+
+			real_special_mask = vector8_highbit_mask(special_mask);
+
+			/* Store carry for next chunk */
+			cstate->prev_inside_quote = inside_prefix16 >> 15;
+			in_quote = (cstate->prev_inside_quote & 1) != 0;
+
+			if (real_special_mask == 0)
 			{
-				/*
-				 * Found a special character. Advance up to that point and let
-				 * the scalar code handle it.
-				 */
-				int advance = pg_rightmost_one_pos32(mask);
-				input_buf_ptr += advance;
-
-				/*
-				 * If we advance less than 5 characters we cause regression.
-				 * Sleep a bit then try again. Sleep time increases
-				 * exponentially.
-				 */
-				if (advance < 5)
-				{
-					if (last_sleep_cyle >= PG_INT16_MAX / 2)
-						last_sleep_cyle = PG_INT16_MAX;
-					else
-						last_sleep_cyle = last_sleep_cyle << 1;
-
-					sleep_cyle = last_sleep_cyle;
-				}
-
-				/*
-				 * If we advance more than 4 charactes this means we have
-				 * performance improvement. Halve sleep time for next sleep.
-				 */
-				else
-				{
-					last_sleep_cyle = Max(last_sleep_cyle >> 1, 1);
-					sleep_cyle = 0;
-				}
-			}
-			else
-			{
-				/*
-				 * No special characters found, so skip the entire chunk and
-				 * halve sleep time for next sleep.
-				 */
+				/* Skip entire chunk */
 				input_buf_ptr += sizeof(Vector8);
-				last_sleep_cyle = Max(last_sleep_cyle >> 1, 1);
+				continue;
+			}
+		}
+		else
+		{
+			/*
+				* Text mode: Look for backslashes and line endings.
+			*/
+				Vector8	special_mask = vector8_or(
+				vector8_eq(chunk, nl),
+				vector8_or(vector8_eq(chunk, cr), vector8_eq(chunk, bs))
+			);
+
+			real_special_mask = vector8_highbit_mask(special_mask);
+
+			if (real_special_mask == 0)
+			{
+				/* Skip entire chunk */
+				input_buf_ptr += sizeof(Vector8);
 				continue;
 			}
 		}
 
-		/*
-		 * Vulnerable to overflow if we are in quote for more than INT16_MAX
-		 * characters.
-		 */
-		sleep_cyle--;
+		/* Find the first real special character position */
+		int	advance = pg_rightmost_one_pos32(real_special_mask);
+
+		input_buf_ptr += advance;
+	}
 #endif
 
 		/* OK to fetch a character */
@@ -1639,6 +1656,8 @@ CopyReadLineText(CopyFromState cstate, bool is_csv)
 			}
 		}
 	}							/* end of outer loop */
+
+	cstate->prev_inside_quote = in_quote;
 
 	/*
 	 * Transfer any still-uncopied data to line_buf.

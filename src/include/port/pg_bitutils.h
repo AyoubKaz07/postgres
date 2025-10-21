@@ -430,6 +430,35 @@ pg_rotate_left32(uint32 word, int n)
 	return (word << n) | (word >> (32 - n));
 }
 
+// static inline uint16 
+// pg_prefix_xor16_carry(uint16_t word, uint16_t carry_in) {
+// 	word ^= -(carry_in & 1); // propagate carry to all bits
+// 	word ^= word >> 8;
+// 	word ^= word >> 4;
+// 	word ^= word >> 2;
+// 	word ^= word >> 1;
+// 	return word;
+// }
+
+static inline uint16
+pg_prefix_xor16_carry(uint16_t word, uint16_t carry)
+{
+	word ^= -(carry & 1); // propagate carry to all bits
+	word ^= (word << 1);
+	word ^= (word << 2);
+	word ^= (word << 4);
+	word ^= (word << 8);
+
+	
+	return word;
+}
+
+static inline uint16
+pg_find_odd_sequences16(uint16_t word, uint16_t prev_odd_carry) {
+	uint16_t prefix = pg_prefix_xor16_carry(word, prev_odd_carry);
+	return prefix & word;
+}
+
 /* size_t variants of the above, as required */
 
 #if SIZEOF_SIZE_T == 4
