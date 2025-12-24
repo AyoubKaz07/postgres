@@ -1268,38 +1268,63 @@ CopyAttributeOutText(CopyToState cstate, const char *string)
 	if (cstate->encoding_embeds_ascii)
 	{
 		start = ptr;
-		#ifndef USE_NO_SIMD
+		const char *end = ptr + strlen(ptr);
+
+		while ((c = *ptr) != '\0')
+		{
+#ifndef USE_NO_SIMD
+			/*
+			 * SIMD fast path: scan ahead for special characters.
+			 * We re-enter this path after handling each special character
+			 * to maximize the benefit of vectorization.
+			 */
 			{
-				const char* end = ptr + strlen(ptr);
-				while (ptr + sizeof(Vector8) <= end) {
-					Vector8 chunk;
-					Vector8 control_mask;
-					Vector8 backslash_mask;
-					Vector8 delim_mask;
-					Vector8 special_mask;
-					uint32 mask;
+				
+				while (ptr + sizeof(Vector8) <= end)
+				{
+					Vector8		chunk;
+					Vector8		control_mask;
+					Vector8		backslash_mask;
+					Vector8		delim_mask;
+					Vector8		special_mask;
+					uint32		mask;
 
 					vector8_load(&chunk, (const uint8 *) ptr);
+					
+					/* Check for control characters (< 0x20) */
 					control_mask = vector8_gt(vector8_broadcast(0x20), chunk);
-					backslash_mask = vector8_eq(vector8_broadcast('\\'), chunk);
-					delim_mask = vector8_eq(vector8_broadcast(delimc), chunk);
+					
+					/* Check for backslash and delimiter */
+					backslash_mask = vector8_eq(chunk, vector8_broadcast('\\'));
+					delim_mask = vector8_eq(chunk, vector8_broadcast(delimc));
+					
 
-					special_mask = vector8_or(control_mask, vector8_or(backslash_mask, delim_mask));
+					/* Combine all masks */
+					special_mask = vector8_or(
+						vector8_or(control_mask, backslash_mask), delim_mask);
 
 					mask = vector8_highbit_mask(special_mask);
-					if (mask != 0) {
+					if (mask != 0)
+					{
+						/* Found special character, advance to it */
 						int advance = pg_rightmost_one_pos32(mask);
 						ptr += advance;
 						break;
 					}
 
+					/* No special characters in this chunk, advance */
 					ptr += sizeof(Vector8);
 				}
-			} 
-		#endif
+				
+				/* Update c after SIMD scan */
+				c = *ptr;
+			}
+#endif /* !USE_NO_SIMD */
 
-		while ((c = *ptr) != '\0')
-		{
+			/* Scalar handling - same code for SIMD and non-SIMD builds */
+			if (c == '\0')
+				break;
+
 			if ((unsigned char) c < (unsigned char) 0x20)
 			{
 				/*
@@ -1358,38 +1383,60 @@ CopyAttributeOutText(CopyToState cstate, const char *string)
 	else
 	{
 		start = ptr;
-		#ifndef USE_NO_SIMD
+		const char *end = ptr + strlen(ptr);
+
+		while ((c = *ptr) != '\0')
+		{
+#ifndef USE_NO_SIMD
+			/*
+			 * SIMD fast path: scan ahead for special characters.
+			 */
 			{
-				const char* end = ptr + strlen(ptr);
-				while (ptr + sizeof(Vector8) <= end) {
-					Vector8 chunk;
-					Vector8 control_mask;
-					Vector8 backslash_mask;
-					Vector8 delim_mask;
-					Vector8 special_mask;
-					uint32 mask;
+				
+				while (ptr + sizeof(Vector8) <= end)
+				{
+					Vector8		chunk;
+					Vector8		control_mask;
+					Vector8		backslash_mask;
+					Vector8		delim_mask;
+					Vector8		special_mask;
+					uint32		mask;
 
 					vector8_load(&chunk, (const uint8 *) ptr);
+					
+					/* Check for control characters (< 0x20) */
 					control_mask = vector8_gt(vector8_broadcast(0x20), chunk);
-					backslash_mask = vector8_eq(vector8_broadcast('\\'), chunk);
-					delim_mask = vector8_eq(vector8_broadcast(delimc), chunk);
+					
+					/* Check for backslash and delimiter */
+					backslash_mask = vector8_eq(chunk, vector8_broadcast('\\'));
+					delim_mask = vector8_eq(chunk, vector8_broadcast(delimc));
 
-					special_mask = vector8_or(control_mask, vector8_or(backslash_mask, delim_mask));
+					/* Combine masks */
+					special_mask = vector8_or(control_mask, 
+											  vector8_or(backslash_mask, delim_mask));
 
 					mask = vector8_highbit_mask(special_mask);
-					if (mask != 0) {
+					if (mask != 0)
+					{
+						/* Found special character */
 						int advance = pg_rightmost_one_pos32(mask);
 						ptr += advance;
 						break;
 					}
 
+					/* No special characters, advance */
 					ptr += sizeof(Vector8);
 				}
-			} 
-		#endif
+				
+				/* Update c after SIMD scan */
+				c = *ptr;
+			}
+#endif /* !USE_NO_SIMD */
 
-		while ((c = *ptr) != '\0')
-		{
+			/* Scalar handling - same for SIMD and non-SIMD */
+			if (c == '\0')
+				break;
+
 			if ((unsigned char) c < (unsigned char) 0x20)
 			{
 				/*
@@ -1489,52 +1536,67 @@ CopyAttributeOutCSV(CopyToState cstate, const char *string,
 		else
 		{
 			const char *tptr = ptr;
+			const char *end = tptr + strlen(tptr);
+			
+			while ((c = *tptr) != '\0') 
+			{
+#ifndef USE_NO_SIMD
+			/*
+			 * SIMD accelerated quote detection.
+			 */
+			{	
+				Vector8		delim_vec;
+				Vector8		quote_vec;
+				Vector8		newline_vec;
+				Vector8		cr_vec;
+				
+				delim_vec = vector8_broadcast(delimc);
+				quote_vec = vector8_broadcast(quotec);
+				newline_vec = vector8_broadcast('\n');
+				cr_vec = vector8_broadcast('\r');
 
-			#ifndef USE_NO_SIMD
-				{	
-					const char* end = tptr + strlen(tptr);
+				while (tptr + sizeof(Vector8) <= end)
+				{
+					Vector8		chunk;
+					Vector8		special_mask;
+					uint32		mask;
 
-					Vector8 delim_mask = vector8_broadcast(delimc);
-					Vector8 quote_mask = vector8_broadcast(quotec);
-					Vector8 newline_mask = vector8_broadcast('\n');
-					Vector8 carriage_return_mask = vector8_broadcast('\r');
+					vector8_load(&chunk, (const uint8 *) tptr);
+					
+					special_mask = vector8_or(
+						vector8_or(vector8_eq(chunk, delim_vec),
+								   vector8_eq(chunk, quote_vec)),
+						vector8_or(vector8_eq(chunk, newline_vec),
+								   vector8_eq(chunk, cr_vec)));
 
-					while (tptr + sizeof(Vector8) <= end) {
-						Vector8 chunk;
-						Vector8 special_mask;
-						uint32 mask;
-
-						vector8_load(&chunk, (const uint8 *) tptr);
-						special_mask = vector8_or(
-							vector8_or(vector8_eq(chunk, delim_mask),
-									   vector8_eq(chunk, quote_mask)),
-							vector8_or(vector8_eq(chunk, newline_mask),
-									   vector8_eq(chunk, carriage_return_mask))
-						);
-
-						mask = vector8_highbit_mask(special_mask);
-						if (mask != 0) {
-							tptr += pg_rightmost_one_pos32(mask);
-							use_quote = true;
-							break;
-						}
-
-						tptr += sizeof(Vector8);
+					mask = vector8_highbit_mask(special_mask);
+					if (mask != 0)
+					{
+						tptr += pg_rightmost_one_pos32(mask);
+						use_quote = true;
+						break;
 					}
-				}
-			#endif
 
-			while ((c = *tptr) != '\0')
+					tptr += sizeof(Vector8);
+				}
+			}
+#endif /* !USE_NO_SIMD */
+
+			/*
+			 * Scalar scan for remaining bytes (tail after SIMD, or entire
+			 * string if USE_NO_SIMD).
+			 */
+			if ((c = *tptr) != '\0')
 			{
 				if (c == delimc || c == quotec || c == '\n' || c == '\r')
 				{
 					use_quote = true;
-					break;
 				}
 				if (IS_HIGHBIT_SET(c) && cstate->encoding_embeds_ascii)
 					tptr += pg_encoding_mblen(cstate->file_encoding, tptr);
 				else
 					tptr++;
+			}
 			}
 		}
 	}
@@ -1548,37 +1610,57 @@ CopyAttributeOutCSV(CopyToState cstate, const char *string,
 		 */
 		start = ptr;
 
-		#ifndef USE_NO_SIMD
+		const char *end = ptr + strlen(ptr);
+
+		while ((c = *ptr) != '\0')
+		{
+#ifndef USE_NO_SIMD
+			/*
+			 * SIMD fast path: scan ahead for quote/escape characters.
+			 * Re-enter after handling each special character.
+			 */
 			{	
-				const char* end = ptr + strlen(ptr);
+				Vector8		escape_vec;
+				Vector8		quote_vec;
+				
+				/* Pre-compute broadcast vectors */
+				escape_vec = vector8_broadcast(escapec);
+				quote_vec = vector8_broadcast(quotec);
 
-				Vector8 escape_mask = vector8_broadcast(escapec);
-				Vector8 quote_mask = vector8_broadcast(quotec);
-
-				while (ptr + sizeof(Vector8) <= end) {
-					Vector8 chunk;
-					Vector8 special_mask;
-					uint32 mask;
+				while (ptr + sizeof(Vector8) <= end)
+				{
+					Vector8		chunk;
+					Vector8		special_mask;
+					uint32		mask;
 
 					vector8_load(&chunk, (const uint8 *) ptr);
+					
 					special_mask = vector8_or(
-						vector8_eq(chunk, escape_mask), 
-							vector8_eq(chunk, quote_mask));
+						vector8_eq(chunk, escape_vec), 
+						vector8_eq(chunk, quote_vec));
 
 					mask = vector8_highbit_mask(special_mask);
-					if (mask != 0) {
-						ptr += pg_rightmost_one_pos32(mask);
-						use_quote = true;
+					if (mask != 0)
+					{
+						/* Found special character */
+						int advance = pg_rightmost_one_pos32(mask);
+						ptr += advance;
 						break;
 					}
 
+					/* No special characters in this chunk */
 					ptr += sizeof(Vector8);
 				}
+				
+				/* Update c after SIMD scan */
+				c = *ptr;
 			}
-		#endif
-		
-		while ((c = *ptr) != '\0')
-		{
+#endif /* !USE_NO_SIMD */
+
+			/* Scalar handling - same code for SIMD and non-SIMD builds */
+			if (c == '\0')
+				break;
+
 			if (c == quotec || c == escapec)
 			{
 				DUMPSOFAR();
