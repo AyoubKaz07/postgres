@@ -31,6 +31,8 @@
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "port/pg_bitutils.h"
+#include "port/simd.h"
 #include "storage/fd.h"
 #include "tcop/tcopprot.h"
 #include "utils/lsyscache.h"
@@ -1266,6 +1268,36 @@ CopyAttributeOutText(CopyToState cstate, const char *string)
 	if (cstate->encoding_embeds_ascii)
 	{
 		start = ptr;
+		#ifndef USE_NO_SIMD
+			{
+				const char* end = ptr + strlen(ptr);
+				while (ptr + sizeof(Vector8) <= end) {
+					Vector8 chunk;
+					Vector8 control_mask;
+					Vector8 backslash_mask;
+					Vector8 delim_mask;
+					Vector8 special_mask;
+					uint32 mask;
+
+					vector8_load(&chunk, (const uint8 *) ptr);
+					control_mask = vector8_gt(vector8_broadcast(0x20), chunk);
+					backslash_mask = vector8_eq(vector8_broadcast('\\'), chunk);
+					delim_mask = vector8_eq(vector8_broadcast(delimc), chunk);
+
+					special_mask = vector8_or(control_mask, vector8_or(backslash_mask, delim_mask));
+
+					mask = vector8_highbit_mask(special_mask);
+					if (mask != 0) {
+						int advance = pg_rightmost_one_pos32(mask);
+						ptr += advance;
+						break;
+					}
+
+					ptr += sizeof(Vector8);
+				}
+			} 
+		#endif
+
 		while ((c = *ptr) != '\0')
 		{
 			if ((unsigned char) c < (unsigned char) 0x20)
@@ -1326,6 +1358,36 @@ CopyAttributeOutText(CopyToState cstate, const char *string)
 	else
 	{
 		start = ptr;
+		#ifndef USE_NO_SIMD
+			{
+				const char* end = ptr + strlen(ptr);
+				while (ptr + sizeof(Vector8) <= end) {
+					Vector8 chunk;
+					Vector8 control_mask;
+					Vector8 backslash_mask;
+					Vector8 delim_mask;
+					Vector8 special_mask;
+					uint32 mask;
+
+					vector8_load(&chunk, (const uint8 *) ptr);
+					control_mask = vector8_gt(vector8_broadcast(0x20), chunk);
+					backslash_mask = vector8_eq(vector8_broadcast('\\'), chunk);
+					delim_mask = vector8_eq(vector8_broadcast(delimc), chunk);
+
+					special_mask = vector8_or(control_mask, vector8_or(backslash_mask, delim_mask));
+
+					mask = vector8_highbit_mask(special_mask);
+					if (mask != 0) {
+						int advance = pg_rightmost_one_pos32(mask);
+						ptr += advance;
+						break;
+					}
+
+					ptr += sizeof(Vector8);
+				}
+			} 
+		#endif
+
 		while ((c = *ptr) != '\0')
 		{
 			if ((unsigned char) c < (unsigned char) 0x20)
@@ -1428,6 +1490,40 @@ CopyAttributeOutCSV(CopyToState cstate, const char *string,
 		{
 			const char *tptr = ptr;
 
+			#ifndef USE_NO_SIMD
+				{	
+					const char* end = tptr + strlen(tptr);
+
+					Vector8 delim_mask = vector8_broadcast(delimc);
+					Vector8 quote_mask = vector8_broadcast(quotec);
+					Vector8 newline_mask = vector8_broadcast('\n');
+					Vector8 carriage_return_mask = vector8_broadcast('\r');
+
+					while (tptr + sizeof(Vector8) <= end) {
+						Vector8 chunk;
+						Vector8 special_mask;
+						uint32 mask;
+
+						vector8_load(&chunk, (const uint8 *) tptr);
+						special_mask = vector8_or(
+							vector8_or(vector8_eq(chunk, delim_mask),
+									   vector8_eq(chunk, quote_mask)),
+							vector8_or(vector8_eq(chunk, newline_mask),
+									   vector8_eq(chunk, carriage_return_mask))
+						);
+
+						mask = vector8_highbit_mask(special_mask);
+						if (mask != 0) {
+							tptr += pg_rightmost_one_pos32(mask);
+							use_quote = true;
+							break;
+						}
+
+						tptr += sizeof(Vector8);
+					}
+				}
+			#endif
+
 			while ((c = *tptr) != '\0')
 			{
 				if (c == delimc || c == quotec || c == '\n' || c == '\r')
@@ -1451,6 +1547,36 @@ CopyAttributeOutCSV(CopyToState cstate, const char *string,
 		 * We adopt the same optimization strategy as in CopyAttributeOutText
 		 */
 		start = ptr;
+
+		#ifndef USE_NO_SIMD
+			{	
+				const char* end = ptr + strlen(ptr);
+
+				Vector8 escape_mask = vector8_broadcast(escapec);
+				Vector8 quote_mask = vector8_broadcast(quotec);
+
+				while (ptr + sizeof(Vector8) <= end) {
+					Vector8 chunk;
+					Vector8 special_mask;
+					uint32 mask;
+
+					vector8_load(&chunk, (const uint8 *) ptr);
+					special_mask = vector8_or(
+						vector8_eq(chunk, escape_mask), 
+							vector8_eq(chunk, quote_mask));
+
+					mask = vector8_highbit_mask(special_mask);
+					if (mask != 0) {
+						ptr += pg_rightmost_one_pos32(mask);
+						use_quote = true;
+						break;
+					}
+
+					ptr += sizeof(Vector8);
+				}
+			}
+		#endif
+		
 		while ((c = *ptr) != '\0')
 		{
 			if (c == quotec || c == escapec)
