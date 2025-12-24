@@ -71,7 +71,9 @@
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "port/pg_bitutils.h"
 #include "port/pg_bswap.h"
+#include "port/simd.h"
 #include "utils/builtins.h"
 #include "utils/rel.h"
 
@@ -141,7 +143,7 @@ static const char BinarySignature[11] = "PGCOPY\n\377\r\n\0";
 
 /* non-export function prototypes */
 static bool CopyReadLine(CopyFromState cstate, bool is_csv);
-static bool CopyReadLineText(CopyFromState cstate, bool is_csv);
+static pg_attribute_always_inline bool CopyReadLineText(CopyFromState cstate, bool is_csv, bool use_simd);
 static int	CopyReadAttributesText(CopyFromState cstate);
 static int	CopyReadAttributesCSV(CopyFromState cstate);
 static Datum CopyReadBinaryAttribute(CopyFromState cstate, FmgrInfo *flinfo,
@@ -1171,8 +1173,40 @@ CopyReadLine(CopyFromState cstate, bool is_csv)
 	resetStringInfo(&cstate->line_buf);
 	cstate->line_buf_valid = false;
 
-	/* Parse data and transfer into line_buf */
-	result = CopyReadLineText(cstate, is_csv);
+#ifndef USE_NO_SIMD
+
+	/*
+	 * Wait until we have read more than CHARS_PROCESSED_UNTIL_SIMD_CHECK.
+	 * cstate->bytes_processed will grow an unpredictable amount with each
+	 * call to this function, so just wait until we have crossed the
+	 * threshold.
+	 */
+	if (!cstate->checked_simd && cstate->chars_processed > CHARS_PROCESSED_UNTIL_SIMD_CHECK)
+	{
+		cstate->checked_simd = true;
+
+		/*
+		 * If we have not read too many special characters then start using
+		 * SIMD to speed up processing. This heuristic assumes that input does
+		 * not vary too much from line to line and that number of special
+		 * characters encountered in the first
+		 * CHARS_PROCESSED_UNTIL_SIMD_CHECK are indicitive of the whole file.
+		 */
+		if (cstate->chars_processed / SPECIAL_CHAR_SIMD_RATIO >= cstate->special_chars_encountered)
+		{
+			cstate->use_simd = true;
+		}
+	}
+#endif
+
+	/*
+	 * Parse data and transfer into line_buf. To get benefit from inlining,
+	 * call CopyReadLineText() with the constant boolean variables.
+	 */
+	if (cstate->use_simd)
+		result = CopyReadLineText(cstate, is_csv, true);
+	else
+		result = CopyReadLineText(cstate, is_csv, false);
 
 	if (result)
 	{
@@ -1239,8 +1273,8 @@ CopyReadLine(CopyFromState cstate, bool is_csv)
 /*
  * CopyReadLineText - inner loop of CopyReadLine for text mode
  */
-static bool
-CopyReadLineText(CopyFromState cstate, bool is_csv)
+static pg_attribute_always_inline bool
+CopyReadLineText(CopyFromState cstate, bool is_csv, bool use_simd)
 {
 	char	   *copy_input_buf;
 	int			input_buf_ptr;
@@ -1255,6 +1289,14 @@ CopyReadLineText(CopyFromState cstate, bool is_csv)
 	char		quotec = '\0';
 	char		escapec = '\0';
 
+#ifndef USE_NO_SIMD
+	Vector8		nl = vector8_broadcast('\n');
+	Vector8		cr = vector8_broadcast('\r');
+	Vector8		bs = vector8_broadcast('\\');
+	Vector8		quote = vector8_broadcast(0);
+	Vector8		escape = vector8_broadcast(0);
+#endif
+
 	if (is_csv)
 	{
 		quotec = cstate->opts.quote[0];
@@ -1262,6 +1304,12 @@ CopyReadLineText(CopyFromState cstate, bool is_csv)
 		/* ignore special escape processing if it's the same as quotec */
 		if (quotec == escapec)
 			escapec = '\0';
+
+#ifndef USE_NO_SIMD
+		quote = vector8_broadcast(quotec);
+		if (quotec != escapec)
+			escape = vector8_broadcast(escapec);
+#endif
 	}
 
 	/*
@@ -1293,7 +1341,7 @@ CopyReadLineText(CopyFromState cstate, bool is_csv)
 	input_buf_ptr = cstate->input_buf_index;
 	copy_buf_len = cstate->input_buf_len;
 
-	for (;;)
+	for (;; cstate->chars_processed++)
 	{
 		int			prev_raw_ptr;
 		char		c;
@@ -1328,9 +1376,84 @@ CopyReadLineText(CopyFromState cstate, bool is_csv)
 			need_data = false;
 		}
 
+#ifndef USE_NO_SIMD
+
+		/*
+		 * Use SIMD instructions to efficiently scan the input buffer for
+		 * special characters (e.g., newline, carriage return, quote, and
+		 * escape). This is faster than byte-by-byte iteration, especially on
+		 * large buffers.
+		 *
+		 * We do not apply the SIMD fast path in either of the following
+		 * cases: - When the previously processed character was an escape
+		 * character (last_was_esc), since the next byte must be examined
+		 * sequentially. - The remaining buffer is smaller than one vector
+		 * width (sizeof(Vector8)); SIMD operates on fixed-size chunks.
+		 */
+		if (use_simd && !last_was_esc && copy_buf_len - input_buf_ptr >= sizeof(Vector8))
+		{
+			Vector8		chunk;
+			Vector8		match = vector8_broadcast(0);
+			uint32		mask;
+
+			/* Load a chunk of data into a vector register */
+			vector8_load(&chunk, (const uint8 *) &copy_input_buf[input_buf_ptr]);
+
+			if (is_csv)
+			{
+				/* \n and \r are not special inside quotes */
+				if (!in_quote)
+					match = vector8_or(vector8_eq(chunk, nl), vector8_eq(chunk, cr));
+
+				match = vector8_or(match, vector8_eq(chunk, quote));
+				if (escapec != '\0')
+					match = vector8_or(match, vector8_eq(chunk, escape));
+			}
+			else
+			{
+				match = vector8_or(vector8_eq(chunk, nl), vector8_eq(chunk, cr));
+				match = vector8_or(match, vector8_eq(chunk, bs));
+			}
+
+			/* Check if we found any special characters */
+			mask = vector8_highbit_mask(match);
+			if (mask != 0)
+			{
+				/*
+				 * Found a special character. Advance up to that point and let
+				 * the scalar code handle it.
+				 */
+				int			advance = pg_rightmost_one_pos32(mask);
+
+				input_buf_ptr += advance;
+			}
+			else
+			{
+				/* No special characters found, so skip the entire chunk */
+				input_buf_ptr += sizeof(Vector8);
+				continue;
+			}
+		}
+#endif
+
 		/* OK to fetch a character */
 		prev_raw_ptr = input_buf_ptr;
 		c = copy_input_buf[input_buf_ptr++];
+
+		/* Use this calculation decide whether to use SIMD later */
+		if (!use_simd && unlikely(!cstate->checked_simd))
+		{
+			if (is_csv)
+			{
+				if (c == '\r' || c == '\n' || c == quotec || c == escapec)
+					cstate->special_chars_encountered++;
+			}
+			else
+			{
+				if (c == '\r' || c == '\n' || c == '\\')
+					cstate->special_chars_encountered++;
+			}
+		}
 
 		if (is_csv)
 		{

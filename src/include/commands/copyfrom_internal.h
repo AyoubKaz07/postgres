@@ -181,6 +181,18 @@ typedef struct CopyFromStateData
 #define RAW_BUF_BYTES(cstate) ((cstate)->raw_buf_len - (cstate)->raw_buf_index)
 
 	uint64		bytes_processed;	/* number of bytes processed so far */
+
+	/* the amount of bytes to read until checking if we should try simd */
+#define CHARS_PROCESSED_UNTIL_SIMD_CHECK 100000
+	/* the ratio of special chars read below which we use simd */
+#define SPECIAL_CHAR_SIMD_RATIO 4
+	uint64		chars_processed;
+	uint64		special_chars_encountered;	/* number of special chars
+											 * encountered so far */
+	bool		checked_simd;	/* we read CHARS_PROCESSED_UNTIL_SIMD_CHECK
+								 * and checked if we should use SIMD on the
+								 * rest of the file */
+	bool		use_simd;		/* use simd to speed up copying */
 } CopyFromStateData;
 
 extern void ReceiveCopyBegin(CopyFromState cstate);
