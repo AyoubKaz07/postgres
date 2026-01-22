@@ -71,7 +71,9 @@
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "port/pg_bitutils.h"
 #include "port/pg_bswap.h"
+#include "port/simd.h"
 #include "utils/builtins.h"
 #include "utils/rel.h"
 
@@ -1248,6 +1250,7 @@ CopyReadLineText(CopyFromState cstate, bool is_csv)
 	bool		need_data = false;
 	bool		hit_eof = false;
 	bool		result = false;
+	int 		simd_boundary;
 
 	/* CSV variables */
 	bool		in_quote = false,
@@ -1292,6 +1295,7 @@ CopyReadLineText(CopyFromState cstate, bool is_csv)
 	copy_input_buf = cstate->input_buf;
 	input_buf_ptr = cstate->input_buf_index;
 	copy_buf_len = cstate->input_buf_len;
+	simd_boundary = input_buf_ptr;
 
 	for (;;)
 	{
@@ -1315,6 +1319,7 @@ CopyReadLineText(CopyFromState cstate, bool is_csv)
 			hit_eof = cstate->input_reached_eof;
 			input_buf_ptr = cstate->input_buf_index;
 			copy_buf_len = cstate->input_buf_len;
+			simd_boundary = input_buf_ptr;
 
 			/*
 			 * If we are completely out of data, break out of the loop,
@@ -1327,6 +1332,33 @@ CopyReadLineText(CopyFromState cstate, bool is_csv)
 			}
 			need_data = false;
 		}
+
+
+#ifndef USE_NO_SIMD
+
+		if (input_buf_ptr >= simd_boundary && !last_was_esc && (copy_buf_len - input_buf_ptr) >= sizeof(Vector8))
+		{
+			Vector8 chunk;
+
+			vector8_load(&chunk, (const uint8 *) &copy_input_buf[input_buf_ptr]);
+
+			if (!(vector8_has(chunk, '\\') ||
+				  vector8_has(chunk, '\r') ||
+				  vector8_has(chunk, '\n') ||
+				  (is_csv && vector8_has(chunk, quotec)) ||
+				  (is_csv && escapec != '\0' && vector8_has(chunk, escapec))))
+			{
+				input_buf_ptr += sizeof(Vector8);
+				simd_boundary = input_buf_ptr;
+				continue;
+			}
+			else
+			{
+
+				simd_boundary = input_buf_ptr + sizeof(Vector8);
+			}
+		}
+#endif
 
 		/* OK to fetch a character */
 		prev_raw_ptr = input_buf_ptr;
