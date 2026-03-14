@@ -117,8 +117,8 @@ static const char BinarySignature[11] = "PGCOPY\n\377\r\n\0";
 static void EndCopy(CopyToState cstate);
 static void ClosePipeToProgram(CopyToState cstate);
 static void CopyOneRowTo(CopyToState cstate, TupleTableSlot *slot);
-static void CopyAttributeOutText(CopyToState cstate, const char *string);
-static void CopyAttributeOutCSV(CopyToState cstate, const char *string,
+static pg_attribute_always_inline void CopyAttributeOutText(CopyToState cstate, const char *string);
+static pg_attribute_always_inline void CopyAttributeOutCSV(CopyToState cstate, const char *string,
 								bool use_quote);
 static void CopyRelationTo(CopyToState cstate, Relation rel, Relation root_rel,
 						   uint64 *processed);
@@ -1239,7 +1239,7 @@ CopyOneRowTo(CopyToState cstate, TupleTableSlot *slot)
 			CopySendData(cstate, start, ptr - start); \
 	} while (0)
 
-static void
+static pg_attribute_always_inline void
 CopyAttributeOutText(CopyToState cstate, const char *string)
 {
 	const char *ptr;
@@ -1392,7 +1392,7 @@ CopyAttributeOutText(CopyToState cstate, const char *string)
  * Send text representation of one attribute, with conversion and
  * CSV-style escaping
  */
-static void
+static pg_attribute_always_inline void
 CopyAttributeOutCSV(CopyToState cstate, const char *string,
 					bool use_quote)
 {
