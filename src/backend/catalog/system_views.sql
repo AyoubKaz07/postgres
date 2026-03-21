@@ -1507,3 +1507,20 @@ CREATE VIEW pg_aios AS
     SELECT * FROM pg_get_aios();
 REVOKE ALL ON pg_aios FROM PUBLIC;
 GRANT SELECT ON pg_aios TO pg_read_all_stats;
+
+CREATE VIEW pg_stat_vfdcache AS
+    SELECT
+        pg_stat_get_vfd_hits()                          AS hits,
+        pg_stat_get_vfd_misses()                        AS misses,
+        pg_stat_get_vfd_evictions()                     AS evictions,
+        pg_stat_get_vfd_cache_size()                    AS cache_size,
+        current_setting('max_files_per_process')::int   AS max_cache_size,
+        CASE
+            WHEN pg_stat_get_vfd_hits() + pg_stat_get_vfd_misses() = 0
+            THEN NULL::float8
+            ELSE pg_stat_get_vfd_hits()::float8
+                 / (pg_stat_get_vfd_hits() + pg_stat_get_vfd_misses())
+        END                                             AS hit_ratio,
+        pg_stat_get_vfd_stat_reset_time()               AS stats_reset;
+ 
+GRANT SELECT ON pg_stat_vfdcache TO PUBLIC;

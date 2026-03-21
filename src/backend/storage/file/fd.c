@@ -1378,6 +1378,7 @@ ReleaseLruFile(void)
 		 * in the ring.
 		 */
 		Assert(VfdCache[0].lruMoreRecently != 0);
+		pgstat_count_vfd_eviction();
 		LruDelete(VfdCache[0].lruMoreRecently);
 		return true;			/* freed a file */
 	}
@@ -1491,6 +1492,7 @@ FileAccess(File file)
 
 	if (FileIsNotOpen(file))
 	{
+		pgstat_count_vfd_miss();
 		returnValue = LruInsert(file);
 		if (returnValue != 0)
 			return returnValue;
@@ -1501,12 +1503,32 @@ FileAccess(File file)
 		 * We now know that the file is open and that it is not the last one
 		 * accessed, so we need to move it to the head of the Lru ring.
 		 */
+		pgstat_count_vfd_hit();
 
 		Delete(file);
 		Insert(file);
 	}
+	else 
+	{
+		/* fd is open and already at MRU end */
+		pgstat_count_vfd_hit();
+	}
 
 	return 0;
+}
+
+/*
+ * GetVfdCacheOccupancy
+ *
+ * Return the number of physical file descriptors currently open in the
+ * VFD cache (nfile).  This is the live cache size exposed by
+ * pg_stat_vfdcache.cache_size.
+ *
+ */
+int
+GetVfdCacheOccupancy(void)
+{
+	return nfile;
 }
 
 /*

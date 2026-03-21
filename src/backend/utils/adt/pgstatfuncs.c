@@ -28,6 +28,7 @@
 #include "replication/logicallauncher.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
+#include "storage/fd.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/timestamp.h"
@@ -1339,6 +1340,58 @@ pg_stat_get_buf_alloc(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_INT64(pgstat_fetch_stat_bgwriter()->buf_alloc);
 }
+
+Datum
+pg_stat_get_vfd_hits(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64(pgstat_fetch_stat_vfdcache()->vfd_hits);
+}
+
+Datum
+pg_stat_get_vfd_misses(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64(pgstat_fetch_stat_vfdcache()->vfd_misses);
+}
+
+Datum
+pg_stat_get_vfd_evictions(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64(pgstat_fetch_stat_vfdcache()->vfd_evictions);
+}
+
+Datum
+pg_stat_get_vfd_cache_size(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT32(GetVfdCacheOccupancy());
+}
+
+/*
+ * pg_stat_get_vfd_stat_reset_time
+ *		Timestamp of the last pg_stat_reset_vfdcache() call, or NULL if
+ *		the counters have never been reset.
+ */
+Datum
+pg_stat_get_vfd_stat_reset_time(PG_FUNCTION_ARGS)
+{
+	TimestampTz ts = pgstat_fetch_stat_vfdcache()->stat_reset_timestamp;
+
+	if (ts == 0)
+		PG_RETURN_NULL();
+
+	PG_RETURN_TIMESTAMPTZ(ts);
+}
+
+/*
+ * pg_stat_reset_vfdcache
+ *		Reset VFD cache counters for the current backend.
+ */
+Datum
+pg_stat_reset_vfdcache(PG_FUNCTION_ARGS)
+{
+	pgstat_reset_vfdcache();
+	PG_RETURN_VOID();
+}
+ 
 
 /*
 * When adding a new column to the pg_stat_io view and the

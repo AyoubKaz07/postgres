@@ -271,6 +271,22 @@ typedef struct PgStat_CheckpointerStats
 	TimestampTz stat_reset_timestamp;
 } PgStat_CheckpointerStats;
 
+/* ---------
+ * PgStat_VfdCacheStats		Virtual File Descriptor cache statistics
+ *
+ * Tracks hit/miss/eviction events in the per-backend VFD cache (fd.c).
+ * Because the VFD cache is strictly per-backend these counters are updated
+ * without any locking.  The view pg_stat_vfdcache exposes them together
+ * with the current cache occupancy.
+ * ---------
+ */
+typedef struct PgStat_VfdCacheStats
+{
+	PgStat_Counter vfd_hits;	  /* fd was open, no open() syscall needed */
+	PgStat_Counter vfd_misses;	  /* fd was VFD_CLOSED, open() was required */
+	PgStat_Counter vfd_evictions; /* close() called to free a slot for a new fd */
+	TimestampTz    stat_reset_timestamp;
+} PgStat_VfdCacheStats;
 
 /*
  * Types related to counting IO operations
@@ -592,6 +608,15 @@ extern PgStat_BgWriterStats *pgstat_fetch_stat_bgwriter(void);
 extern void pgstat_report_checkpointer(void);
 extern PgStat_CheckpointerStats *pgstat_fetch_stat_checkpointer(void);
 
+/*
+ * Functions in pgstat_vfdcache.c
+ */
+
+extern PgStat_VfdCacheStats *pgstat_fetch_stat_vfdcache(void);
+extern void pgstat_reset_vfdcache(void);
+#define pgstat_count_vfd_hit()		(PendingVfdCacheStats.vfd_hits++)
+#define pgstat_count_vfd_miss()		(PendingVfdCacheStats.vfd_misses++)
+#define pgstat_count_vfd_eviction()	(PendingVfdCacheStats.vfd_evictions++)
 
 /*
  * Functions in pgstat_io.c
@@ -823,6 +848,12 @@ extern PGDLLIMPORT int pgstat_fetch_consistency;
 /* updated directly by bgwriter and bufmgr */
 extern PGDLLIMPORT PgStat_BgWriterStats PendingBgWriterStats;
 
+/*
+ * Variables in pgstat_vfdcache.c
+ */
+
+/* updated directly by fd.cn (per-backend) */
+extern PGDLLIMPORT PgStat_VfdCacheStats PendingVfdCacheStats;
 
 /*
  * Variables in pgstat_checkpointer.c
