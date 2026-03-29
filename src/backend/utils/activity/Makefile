@@ -32,6 +32,7 @@ OBJS = \
 	pgstat_shmem.o \
 	pgstat_slru.o \
 	pgstat_subscription.o \
+	pgstat_vfdcache.o \
 	pgstat_wal.o \
 	pgstat_xact.o \
 	wait_event.o \

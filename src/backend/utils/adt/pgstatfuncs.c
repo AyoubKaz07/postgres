@@ -14,6 +14,7 @@
  */
 #include "postgres.h"
 
+#include "access/xact.h"
 #include "access/htup_details.h"
 #include "access/xlog.h"
 #include "access/xlogprefetcher.h"
@@ -28,6 +29,7 @@
 #include "replication/logicallauncher.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
+#include "storage/fd.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/timestamp.h"
@@ -1341,6 +1343,122 @@ pg_stat_get_buf_alloc(PG_FUNCTION_ARGS)
 }
 
 /*
+ * Sum per-backend VFD gauges across currently active backends.
+ */
+static void
+pgstat_get_vfd_backend_sums(PgStat_Counter *entries_sum,
+							PgStat_Counter *bytes_sum)
+{
+	static TimestampTz cached_stmt_start_ts = 0;
+	static PgStat_Counter cached_entries_sum = 0;
+	static PgStat_Counter cached_bytes_sum = 0;
+	TimestampTz stmt_start_ts = GetCurrentStatementStartTimestamp();
+	int			num_backends = pgstat_fetch_stat_numbackends();
+
+	if (cached_stmt_start_ts == stmt_start_ts)
+	{
+		*entries_sum = cached_entries_sum;
+		*bytes_sum = cached_bytes_sum;
+		return;
+	}
+
+	*entries_sum = 0;
+	*bytes_sum = 0;
+
+	for (int curr_backend = 1; curr_backend <= num_backends; curr_backend++)
+	{
+		LocalPgBackendStatus *local_beentry;
+		PgBackendStatus *beentry;
+		PgStat_Backend *backend_stats;
+
+		local_beentry = pgstat_get_local_beentry_by_index(curr_backend);
+		beentry = &local_beentry->backendStatus;
+
+		if (!pgstat_tracks_backend_bktype(beentry->st_backendType))
+			continue;
+
+		backend_stats = pgstat_fetch_stat_backend(local_beentry->proc_number);
+		if (!backend_stats)
+			continue;
+
+		*entries_sum += backend_stats->vfd_stats.vfd_entries;
+		*bytes_sum += backend_stats->vfd_stats.vfd_cache_bytes;
+	}
+
+	cached_entries_sum = *entries_sum;
+	cached_bytes_sum = *bytes_sum;
+	cached_stmt_start_ts = stmt_start_ts;
+}
+
+Datum
+pg_stat_get_vfd_hits(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64(pgstat_fetch_stat_vfdcache()->vfd_hits);
+}
+
+Datum
+pg_stat_get_vfd_misses(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64(pgstat_fetch_stat_vfdcache()->vfd_misses);
+}
+
+Datum
+pg_stat_get_vfd_evictions(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64(pgstat_fetch_stat_vfdcache()->vfd_evictions);
+}
+
+Datum
+pg_stat_get_vfd_cache_size(PG_FUNCTION_ARGS)
+{
+	PgStat_Counter entries_sum;
+	PgStat_Counter bytes_dummy;
+
+	pgstat_get_vfd_backend_sums(&entries_sum, &bytes_dummy);
+
+	PG_RETURN_INT32((int32) entries_sum);
+}
+
+Datum
+pg_stat_get_vfd_cache_bytes(PG_FUNCTION_ARGS)
+{
+	PgStat_Counter entries_sum;
+	PgStat_Counter bytes_sum;
+
+	pgstat_get_vfd_backend_sums(&entries_sum, &bytes_sum);
+
+	PG_RETURN_INT64(bytes_sum);
+}
+
+/*
+ * pg_stat_get_vfd_stat_reset_time
+ *		Timestamp of the last pg_stat_reset_vfdcache() call, or NULL if
+ *		the counters have never been reset.
+ */
+Datum
+pg_stat_get_vfd_stat_reset_time(PG_FUNCTION_ARGS)
+{
+	TimestampTz ts = pgstat_fetch_stat_vfdcache()->stat_reset_timestamp;
+
+	if (ts == 0)
+		PG_RETURN_NULL();
+
+	PG_RETURN_TIMESTAMPTZ(ts);
+}
+
+/*
+ * pg_stat_reset_vfdcache
+ *		Reset shared VFD cache counters.
+ */
+Datum
+pg_stat_reset_vfdcache(PG_FUNCTION_ARGS)
+{
+	pgstat_reset_vfdcache();
+	PG_RETURN_VOID();
+}
+
+
+/*
 * When adding a new column to the pg_stat_io view and the
 * pg_stat_get_backend_io() function, add a new enum value here above
 * IO_NUM_COLUMNS.
@@ -1965,6 +2083,7 @@ pg_stat_reset_shared(PG_FUNCTION_ARGS)
 		XLogPrefetchResetStats();
 		pgstat_reset_of_kind(PGSTAT_KIND_SLRU);
 		pgstat_reset_of_kind(PGSTAT_KIND_WAL);
+		pgstat_reset_of_kind(PGSTAT_KIND_VFDCACHE);
 
 		PG_RETURN_VOID();
 	}
@@ -1987,11 +2106,13 @@ pg_stat_reset_shared(PG_FUNCTION_ARGS)
 		pgstat_reset_of_kind(PGSTAT_KIND_SLRU);
 	else if (strcmp(target, "wal") == 0)
 		pgstat_reset_of_kind(PGSTAT_KIND_WAL);
+	else if (strcmp(target, "vfdcache") == 0)
+		pgstat_reset_of_kind(PGSTAT_KIND_VFDCACHE);
 	else
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("unrecognized reset target: \"%s\"", target),
-				 errhint("Target must be \"archiver\", \"bgwriter\", \"checkpointer\", \"io\", \"recovery_prefetch\", \"slru\", or \"wal\".")));
+				 errhint("Target must be \"archiver\", \"bgwriter\", \"checkpointer\", \"io\", \"recovery_prefetch\", \"slru\", \"vfdcache\", or \"wal\".")));
 
 	PG_RETURN_VOID();
 }

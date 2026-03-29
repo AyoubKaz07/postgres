@@ -272,6 +272,35 @@ typedef struct PgStat_CheckpointerStats
 	TimestampTz stat_reset_timestamp;
 } PgStat_CheckpointerStats;
 
+/* ---------
+ * PgStat_VfdCacheStats		Virtual File Descriptor cache statistics
+ *
+ * Tracks hit/miss/eviction events in the VFD cache (fd.c).  These counters
+ * are accumulated in shared fixed stats and exposed by pg_stat_vfdcache.
+ * ---------
+ */
+typedef struct PgStat_VfdCacheStats
+{
+	PgStat_Counter vfd_hits;	/* fd was open, no open() syscall needed */
+	PgStat_Counter vfd_misses;	/* fd was VFD_CLOSED, open() was required */
+	PgStat_Counter vfd_evictions;	/* close() called to free a slot for a new
+									 * fd */
+	TimestampTz stat_reset_timestamp;
+}			PgStat_VfdCacheStats;
+
+/* ---------
+ * PgStat_BackendVfdCacheStats	VFD cache stats stored per backend
+ *
+ * Keeps per-backend VFD gauges in PGSTAT_KIND_BACKEND entries.
+ * vfd_entries and vfd_cache_bytes represent the current backend-local VFD
+ * cache footprint and are used to derive cluster-wide totals.
+ * ---------
+ */
+typedef struct PgStat_BackendVfdCacheStats
+{
+	PgStat_Counter vfd_entries;
+	PgStat_Counter vfd_cache_bytes;
+}			PgStat_BackendVfdCacheStats;
 
 /*
  * Types related to counting IO operations
@@ -521,6 +550,7 @@ typedef struct PgStat_WalStats
 typedef struct PgStat_Backend
 {
 	TimestampTz stat_reset_timestamp;
+	PgStat_BackendVfdCacheStats vfd_stats;
 	PgStat_BktypeIO io_stats;
 	PgStat_WalCounters wal_counters;
 } PgStat_Backend;
@@ -611,6 +641,15 @@ extern PgStat_BgWriterStats *pgstat_fetch_stat_bgwriter(void);
 extern void pgstat_report_checkpointer(void);
 extern PgStat_CheckpointerStats *pgstat_fetch_stat_checkpointer(void);
 
+/*
+ * Functions in pgstat_vfdcache.c
+ */
+
+extern PgStat_VfdCacheStats * pgstat_fetch_stat_vfdcache(void);
+extern void pgstat_reset_vfdcache(void);
+extern void pgstat_count_vfd_hit(void);
+extern void pgstat_count_vfd_miss(void);
+extern void pgstat_count_vfd_eviction(void);
 
 /*
  * Functions in pgstat_io.c
@@ -851,6 +890,12 @@ extern PGDLLIMPORT int pgstat_fetch_consistency;
 /* updated directly by bgwriter and bufmgr */
 extern PGDLLIMPORT PgStat_BgWriterStats PendingBgWriterStats;
 
+/*
+ * Variables in pgstat_vfdcache.c
+ */
+
+/* updated by VFD counting functions called from fd.c */
+extern PGDLLIMPORT PgStat_VfdCacheStats PendingVfdCacheStats;
 
 /*
  * Variables in pgstat_checkpointer.c

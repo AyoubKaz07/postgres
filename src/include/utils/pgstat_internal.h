@@ -488,6 +488,15 @@ typedef struct PgStatShared_Wal
 	PgStat_WalStats stats;
 } PgStatShared_Wal;
 
+typedef struct PgStatShared_VfdCache
+{
+	/* lock protects ->reset_offset as well as stats->stat_reset_timestamp */
+	LWLock		lock;
+	uint32		changecount;
+	PgStat_VfdCacheStats stats;
+	PgStat_VfdCacheStats reset_offset;
+}			PgStatShared_VfdCache;
+
 
 
 /* ----------
@@ -583,6 +592,7 @@ typedef struct PgStat_ShmemControl
 	PgStatShared_Lock lock;
 	PgStatShared_SLRU slru;
 	PgStatShared_Wal wal;
+	PgStatShared_VfdCache vfdcache;
 
 	/*
 	 * Custom stats data with fixed-numbered objects, indexed by (PgStat_Kind
@@ -618,6 +628,8 @@ typedef struct PgStat_Snapshot
 	PgStat_SLRUStats slru[SLRU_NUM_ELEMENTS];
 
 	PgStat_WalStats wal;
+
+	PgStat_VfdCacheStats vfdcache;
 
 	/*
 	 * Data in snapshot for custom fixed-numbered statistics, indexed by
@@ -730,6 +742,16 @@ extern void pgstat_bgwriter_snapshot_cb(void);
 extern void pgstat_checkpointer_init_shmem_cb(void *stats);
 extern void pgstat_checkpointer_reset_all_cb(TimestampTz ts);
 extern void pgstat_checkpointer_snapshot_cb(void);
+
+
+/*
+ * Functions in pgstat_vfdcache.c
+ */
+
+extern bool pgstat_vfdcache_flush_cb(bool nowait);
+extern void pgstat_vfdcache_init_shmem_cb(void *stats);
+extern void pgstat_vfdcache_reset_all_cb(TimestampTz ts);
+extern void pgstat_vfdcache_snapshot_cb(void);
 
 
 /*

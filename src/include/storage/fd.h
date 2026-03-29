@@ -149,6 +149,9 @@ extern char *FilePathName(File file);
 extern int	FileGetRawDesc(File file);
 extern int	FileGetRawFlags(File file);
 extern mode_t FileGetRawMode(File file);
+extern int	GetVfdCacheOccupancy(void);
+extern uint64 GetVfdCacheEntries(void);
+extern uint64 GetVfdCacheBytes(void);
 
 /* Operations used for sharing named temporary files */
 extern File PathNameCreateTemporaryFile(const char *path, bool error_on_failure);
